@@ -1,0 +1,47 @@
+# SnowBrains feeds in the cloud: runs every 20 minutes, 24 hours a day, free on a public repository.
+# 1. the feed factory (roads, avalanche, page watch, news searches, Google News relay)
+# 2. the collector: every feed in Subscriptions.opml -> nnw.sqlite (same layout as NetNewsWire's database)
+# Output goes to the "data" branch, replaced each run so the repository stays small:
+#   https://raw.githubusercontent.com/OWNER/snow-feeds/data/nnw.sqlite.gz   (what the cloud scan reads)
+#   https://raw.githubusercontent.com/OWNER/snow-feeds/data/status.json     (feed factory health)
+#   https://raw.githubusercontent.com/OWNER/snow-feeds/data/collect_status.json
+name: feeds
+on:
+  schedule:
+    - cron: "4,24,44 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: feeds
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Restore the previous run (what has already been seen)
+        run: |
+          mkdir -p out
+          if git fetch --depth=1 origin data 2>/dev/null; then git --work-tree=out checkout FETCH_HEAD -- . ; git reset -q; fi
+          if [ -f out/nnw.sqlite.gz ]; then gunzip -f out/nnw.sqlite.gz; fi
+          if [ -f seed.sqlite.gz ]; then gunzip -kf seed.sqlite.gz; fi
+      - name: Feed factory (roads, avalanche, page watch, news searches, Google News relay)
+        env:
+          NPS_API_KEY: ${{ secrets.NPS_API_KEY }}
+          SBFF_OPML: Subscriptions.opml
+        run: python3 feedfactory.py run --out out || echo "feed factory failed; carrying on with the collector"
+      - name: Collector (every feed in Subscriptions.opml)
+        run: python3 collect.py --opml Subscriptions.opml --ff out --db out/nnw.sqlite --seed seed.sqlite
+      - name: Publish to the data branch
+        run: |
+          gzip -9f out/nnw.sqlite
+          cd out
+          rm -rf .git && git init -q -b data
+          git config user.name "snow-feeds" && git config user.email "snow-feeds@users.noreply.github.com"
+          git add -A && git commit -qm "feeds $(date -u +%FT%TZ)"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
