@@ -12,10 +12,10 @@ Keeps 3 days of articles, and 60 days for snowbrains.com and competitor feeds (p
 Standard library only.
 """
 import argparse, concurrent.futures as cf, email.utils, gzip, hashlib, html, json, os, re, sqlite3, time, zlib
-import urllib.error, urllib.request, xml.etree.ElementTree as ET
+import urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-VERSION = "2026-11-27a"
+VERSION = "2026-11-27b"
 UA = "Mozilla/5.0 (compatible; SnowBrains-collector/%s; +https://snowbrains.com)" % VERSION
 KEEP_DAYS, LONG_DAYS, SEEN_DAYS = 3, 60, 30
 LONG_KEEP = ("snowbrains.com", "powder.com", "unofficialnetworks", "tetongravity", "skimag", "planetski", "onthesnow",
@@ -48,8 +48,8 @@ def opml_feeds(path):
     return out
 
 
-def fetch(url, etag=None, modified=None, timeout=25):
-    h = {"User-Agent": UA, "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+def fetch(url, etag=None, modified=None, timeout=40):
+    h = {"User-Agent": UA, "Accept": "*/*",   # some WordPress/GovDelivery sites answer 406/415 to a narrower Accept
          "Accept-Encoding": "gzip, deflate"}
     if etag: h["If-None-Match"] = etag
     if modified: h["If-Modified-Since"] = modified
@@ -93,7 +93,8 @@ def strip_tags(s):
 
 def parse(b):
     """Return list of dicts: uid, title, link, summary, content, pub, mod, author."""
-    b = re.sub(rb"^\s+", b"", b)
+    b = re.sub(rb"^(\xef\xbb\xbf)?\s+", b"", b)
+    b = re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]", b"", b)
     # some feeds declare entities that ElementTree doesn't know
     b = re.sub(rb"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", b"&amp;", b)
     root = ET.fromstring(b)
@@ -144,6 +145,26 @@ def collect(args):
         if "127.0.0.1:8511/" in u: jobs.append((u, "local", os.path.join(args.ff, u.split("8511/", 1)[1]))); continue
         jobs.append((u, "web", None))
 
+    def host(u):
+        if "/search/?f=rss" in u: return "townnews"   # BLOX/TownNews papers share a backend that throttles bursts
+        return urllib.parse.urlsplit(u).netloc.lower()
+
+    GAP = {"townnews": 4.0, "www.reddit.com": 4.0, "old.reddit.com": 4.0}
+
+    def one(job):
+        u, kind, path = job
+        r = work(job)
+        if r[1] == "err" and re.search(r"429|timed out|Timeout|503|502", r[5] or ""):
+            time.sleep(12); r = work(job)   # one retry after a pause
+        return r
+
+    def lane(js):
+        out = []
+        for i, j in enumerate(js):
+            if i: time.sleep(GAP.get(host(j[0]), 1.0))
+            out.append(one(j))
+        return out
+
     def work(job):
         u, kind, path = job
         try:
@@ -157,8 +178,12 @@ def collect(args):
             return u, "err", None, None, None, ("%s: %s" % (type(e).__name__, e))[:160]
 
     new_total, ok, notmod, bad = 0, 0, 0, 0
+    lanes = {}
+    for j in jobs: lanes.setdefault(host(j[0]) if j[1] == "web" else "local:" + j[0], []).append(j)
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for u, code, b, et, mo, err in ex.map(work, jobs):
+        results = [r for rs in ex.map(lane, sorted(lanes.values(), key=len, reverse=True)) for r in rs]
+    if True:
+        for u, code, b, et, mo, err in results:
             n = 0
             if code == 200:
                 try:
